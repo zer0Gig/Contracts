@@ -17,7 +17,13 @@ async function main() {
 
   // --- 2. Deploy ProgressiveEscrow ---
   // Alignment Node Verifier: gunakan env var atau deployer address sebagai placeholder
-  const alignmentNodeVerifier = process.env.ALIGNMENT_NODE_VERIFIER || deployer.address;
+  let alignmentNodeVerifier = process.env.ALIGNMENT_NODE_VERIFIER || deployer.address;
+  try {
+    alignmentNodeVerifier = hre.ethers.getAddress(alignmentNodeVerifier);
+  } catch {
+    console.log("Invalid ALIGNMENT_NODE_VERIFIER, using deployer address as placeholder");
+    alignmentNodeVerifier = deployer.address;
+  }
   console.log("\n--- Deploying ProgressiveEscrow ---");
   console.log("Using Alignment Node Verifier:", alignmentNodeVerifier);
 
@@ -27,16 +33,42 @@ async function main() {
   const escrowAddress = await escrow.getAddress();
   console.log("ProgressiveEscrow deployed to:", escrowAddress);
 
-  // --- 3. Link: AgentRegistry.setEscrowContract() ---
+  // --- 3. Link: AgentRegistry.addEscrowContract() ---
   console.log("\n--- Linking AgentRegistry ↔ ProgressiveEscrow ---");
-  const linkTx = await agentRegistry.setEscrowContract(escrowAddress);
+  const linkTx = await agentRegistry.addEscrowContract(escrowAddress);
   await linkTx.wait();
-  console.log("AgentRegistry.escrowContract set to:", escrowAddress);
+  console.log("AgentRegistry authorized escrow:", escrowAddress);
 
-  // --- 4. Save deployment info ---
+  // --- 4. Register platform wallet as authorized releaser ---
+  const platformWallet = process.env.PLATFORM_WALLET || deployer.address;
+  console.log("\n--- Registering platform wallet as authorized releaser ---");
+  console.log("Platform wallet:", platformWallet);
+  const releaserTx = await escrow.addAuthorizedReleaser(platformWallet);
+  await releaserTx.wait();
+  console.log("Platform wallet authorized as releaser:", platformWallet);
+
+  // --- 5. Deploy SubscriptionEscrow (TIER 3) ---
+  console.log("\n--- Deploying SubscriptionEscrow ---");
+  const SubscriptionEscrow = await hre.ethers.getContractFactory("SubscriptionEscrow");
+  const subscriptionEscrow = await SubscriptionEscrow.deploy(registryAddress);
+  await subscriptionEscrow.waitForDeployment();
+  const subscriptionEscrowAddress = await subscriptionEscrow.getAddress();
+  console.log("SubscriptionEscrow deployed to:", subscriptionEscrowAddress);
+
+  // --- 5. Deploy UserRegistry ---
+  console.log("\n--- Deploying UserRegistry ---");
+  const UserRegistry = await hre.ethers.getContractFactory("UserRegistry");
+  const userRegistry = await UserRegistry.deploy();
+  await userRegistry.waitForDeployment();
+  const userRegistryAddress = await userRegistry.getAddress();
+  console.log("UserRegistry deployed to:", userRegistryAddress);
+
+  // --- 6. Save deployment info ---
   const deployment = {
     AgentRegistry: registryAddress,
     ProgressiveEscrow: escrowAddress,
+    SubscriptionEscrow: subscriptionEscrowAddress,
+    UserRegistry: userRegistryAddress,
     AlignmentNodeVerifier: alignmentNodeVerifier,
     chainId: (await hre.ethers.provider.getNetwork()).chainId.toString(),
     deployer: deployer.address,
