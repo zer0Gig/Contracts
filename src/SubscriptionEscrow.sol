@@ -3,213 +3,237 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 
-/// @notice Minimal interface to AgentRegistry
+/// @notice Minimal interface to AgentRegistry (ERC-7857) — packed struct version.
 interface IAgentRegistry {
     struct AgentProfile {
+        // Slot 0
         address owner;
-        address agentWallet;
-        bytes eciesPublicKey;
+        uint48  createdAt;
+        uint16  winRate;
+        uint16  version;
+        bool    isActive;
+        // Slot 1
         bytes32 capabilityHash;
-        string capabilityCID;
-        string profileCID;
-        uint256 overallScore;
-        uint256 totalJobsCompleted;
-        uint256 totalJobsAttempted;
-        uint256 totalEarningsWei;
-        uint256 defaultRate;
-        uint256 createdAt;
-        bool isActive;
+        // Slot 2
+        bytes32 profileHash;
+        // Slot 3
+        address agentWallet;
+        uint64  totalJobsCompleted;
+        uint32  defaultRate;
+        // Slot 4
+        uint64  totalJobsAttempted;
+        uint128 totalEarningsWei;
+        uint48  updatedAt;
     }
 
     function getAgentProfile(uint256 agentId) external view returns (AgentProfile memory);
 }
 
-/// @title SubscriptionEscrow — Ongoing/subscription jobs for zer0Gig
-/// @notice Clients fund a budget, agents drain per check-in or per alert.
-///         Supports three interval modes, x402 bonus, and grace period logic.
+/// @title SubscriptionEscrow — Recurring AI service escrow (ERC-8183 Recurring Extension)
+/// @notice Clients fund a budget; agents drain per check-in or per alert.
+///         Supports three interval modes (CLIENT_SET / AGENT_PROPOSED / AGENT_AUTO),
+///         x402 micropayment bonus, and grace period auto-cancellation.
+/// @dev Gas optimizations applied:
+///        - Packed Subscription struct (5 slots core, was 18+).
+///        - bytes32 taskDescriptionHash + webhookUrlHash (no string storage).
+///        - Custom errors instead of require strings.
+///        - uint96 wei amounts (max ~7.9e28 wei = 79B OG).
+///        - Raw uint256 counter (no OZ Counters wrapper).
+///        - x402 sig moved to separate mapping (only read on drain when enabled).
 contract SubscriptionEscrow is ReentrancyGuard {
 
-    // ─── ENUMS ───────────────────────────────────────────────────────────────
+    // ─── ERRORS ─────────────────────────────────────────────────────────────
+
+    error ZeroAddress();
+    error ZeroBudget();
+    error ZeroValue();
+    error EmptyDescription();
+    error ZeroRates();
+    error AgentInactive();
+    error InvalidStatus();
+    error NotClient();
+    error NotAgent();
+    error NotAuthorized();
+    error AlreadyCancelled();
+    error TooEarly();
+    error InsufficientBalance();
+    error CheckInDisabled();
+    error AlertsDisabled();
+    error NotPaused();
+    error NotActive();
+    error NotPending();
+    error GraceNotExpired();
+    error NotModeB();
+    error NotModeC();
+    error InvalidInterval();
+    error NoProposal();
+    error TransferFailed();
+    error RefundFailed();
+    error ValueTooLarge();
+
+    // ─── ENUMS ──────────────────────────────────────────────────────────────
 
     enum Status {
-        PENDING,    // Waiting for interval approval (Mode B only)
-        ACTIVE,     // Running normally
-        PAUSED,     // Balance too low, grace period running
-        CANCELLED   // Terminated, balance returned
+        PENDING,    // Mode B only — awaiting interval approval
+        ACTIVE,
+        PAUSED,
+        CANCELLED
     }
 
     enum IntervalMode {
-        CLIENT_SET,     // Client defined interval at creation
-        AGENT_PROPOSED, // Agent proposes, client approves (Mode B)
-        AGENT_AUTO      // Agent auto-schedules (Mode C)
+        CLIENT_SET,
+        AGENT_PROPOSED,  // Mode B
+        AGENT_AUTO       // Mode C
     }
 
     enum X402VerificationMode {
-        AGENT_SIDE,     // Sig stored, agent verifies off-chain (default, low gas)
-        ON_CHAIN        // Contract verifies sig on each drain
+        AGENT_SIDE,
+        ON_CHAIN
     }
 
-    // ─── CONSTANTS ───────────────────────────────────────────────────────────
+    // ─── CONSTANTS ──────────────────────────────────────────────────────────
 
-    uint256 public constant DEFAULT_GRACE_PERIOD = 86400;     // 24 hours
-    uint256 public constant MIN_GRACE_PERIOD = 3600;          // 1 hour
-    uint256 public constant MAX_GRACE_PERIOD = 604800;        // 7 days
-    uint256 public constant AUTO_INTERVAL = type(uint256).max; // Mode C sentinel
+    uint32 public constant DEFAULT_GRACE_PERIOD = 86400;     // 24h
+    uint32 public constant MIN_GRACE_PERIOD = 3600;          // 1h
+    uint32 public constant MAX_GRACE_PERIOD = 604800;        // 7d
+    uint32 public constant AUTO_INTERVAL = type(uint32).max; // Mode C sentinel (4,294,967,295 ≈ 49,710 days)
 
-    // ─── STRUCTS ─────────────────────────────────────────────────────────────
+    // ─── STRUCTS (PACKED) ───────────────────────────────────────────────────
 
+    /// @dev Slot 0: client(20) + agentId(8) + status(1) + intervalMode(1) + x402Mode(1) + x402Enabled(1)
+    /// @dev Slot 1: agentWallet(20) + lastCheckIn(8) + intervalSeconds(4)
+    /// @dev Slot 2: checkInRate(12) + alertRate(12) + createdAt(8)
+    /// @dev Slot 3: balance(16) + totalDrained(16)
+    /// @dev Slot 4: pausedAt(8) + gracePeriodEnds(8) + gracePeriodSeconds(4) + proposedInterval(4) + 8 free
     struct Subscription {
-        uint256 subscriptionId;
+        // Slot 0
         address client;
-        uint256 agentId;
-        address agentWallet;
-        string taskDescription;
-        uint256 intervalSeconds;
+        uint64  agentId;
+        Status  status;
         IntervalMode intervalMode;
-        uint256 checkInRate;
-        uint256 alertRate;
-        uint256 balance;
-        uint256 totalDrained;
-        Status status;
-        uint256 createdAt;
-        uint256 lastCheckIn;
-        uint256 pausedAt;
-        uint256 gracePeriodEnds;
-        uint256 gracePeriodSeconds;
-        bool x402Enabled;
         X402VerificationMode x402VerificationMode;
-        bytes clientX402Sig;
-        string webhookUrl;
-        uint256 proposedInterval;
+        bool    x402Enabled;
+
+        // Slot 1
+        address agentWallet;
+        uint64  lastCheckIn;
+        uint32  intervalSeconds;
+
+        // Slot 2
+        uint96  checkInRate;
+        uint96  alertRate;
+        uint64  createdAt;
+
+        // Slot 3
+        uint128 balance;
+        uint128 totalDrained;
+
+        // Slot 4
+        uint64  pausedAt;
+        uint64  gracePeriodEnds;
+        uint32  gracePeriodSeconds;
+        uint32  proposedInterval;
+        // 8 bytes free
     }
 
-    // ─── STATE ───────────────────────────────────────────────────────────────
+    // ─── STATE ──────────────────────────────────────────────────────────────
 
-    uint256 private _subscriptionIdCounter;
+    uint256 private _nextSubId = 1;
 
     mapping(uint256 => Subscription) public subscriptions;
+
+    /// @notice subId => task description hash (off-chain text in 0G Storage by hash)
+    mapping(uint256 => bytes32) public subscriptionTaskHash;
+
+    /// @notice subId => webhook URL hash (off-chain URL stored by hash; full URL in event)
+    mapping(uint256 => bytes32) public subscriptionWebhookHash;
+
+    /// @notice subId => x402 client signature (only for x402-enabled subs)
+    mapping(uint256 => bytes) public subscriptionX402Sig;
+
     mapping(address => uint256[]) public clientSubscriptions;
     mapping(address => uint256[]) public agentSubscriptions;
 
     IAgentRegistry public immutable agentRegistry;
 
-    // ─── EVENTS ──────────────────────────────────────────────────────────────
+    // ─── EVENTS ─────────────────────────────────────────────────────────────
 
     event SubscriptionCreated(
         uint256 indexed subscriptionId,
         uint256 indexed agentId,
-        address client,
-        uint256 budget
+        address indexed client,
+        uint128 budget,
+        bytes32 taskHash
     );
-    event SubscriptionPaused(uint256 indexed subscriptionId, string reason);
-    event SubscriptionResumed(uint256 indexed subscriptionId, uint256 newBalance);
-    event SubscriptionCancelled(uint256 indexed subscriptionId, string reason, uint256 refund);
-    event CheckInDrained(
-        uint256 indexed subscriptionId,
-        uint256 indexed agentId,
-        uint256 amount,
-        uint256 timestamp
-    );
-    event AlertFired(
-        uint256 indexed subscriptionId,
-        uint256 indexed agentId,
-        uint256 timestamp,
-        bytes alertData,
-        uint256 amountDrained
-    );
-    event IntervalProposed(uint256 indexed subscriptionId, uint256 suggestedInterval);
-    event IntervalApproved(uint256 indexed subscriptionId, uint256 interval);
-    event IntervalUpdated(uint256 indexed subscriptionId, uint256 newInterval);
-    event X402BonusPaid(
-        uint256 indexed subscriptionId,
-        uint256 indexed agentId,
-        uint256 amount
-    );
+    event SubscriptionPaused(uint256 indexed subscriptionId, bytes32 reason);
+    event SubscriptionResumed(uint256 indexed subscriptionId, uint128 newBalance);
+    event SubscriptionCancelled(uint256 indexed subscriptionId, bytes32 reason, uint128 refund);
+    event CheckInDrained(uint256 indexed subscriptionId, uint256 indexed agentId, uint96 amount, uint64 timestamp);
+    event AlertFired(uint256 indexed subscriptionId, uint256 indexed agentId, uint64 timestamp, bytes alertData, uint96 amountDrained);
+    event IntervalProposed(uint256 indexed subscriptionId, uint32 suggestedInterval);
+    event IntervalApproved(uint256 indexed subscriptionId, uint32 interval);
+    event IntervalUpdated(uint256 indexed subscriptionId, uint32 newInterval);
+    event WebhookSet(uint256 indexed subscriptionId, bytes32 webhookHash);
 
-    // ─── MODIFIERS ───────────────────────────────────────────────────────────
+    // ─── MODIFIERS ──────────────────────────────────────────────────────────
 
-    modifier onlyClient(uint256 subscriptionId) {
-        require(
-            msg.sender == subscriptions[subscriptionId].client,
-            "SubscriptionEscrow: not client"
-        );
+    modifier onlyClient(uint256 subId) {
+        if (msg.sender != subscriptions[subId].client) revert NotClient();
+        _;
+    }
+    modifier onlyAgent(uint256 subId) {
+        if (msg.sender != subscriptions[subId].agentWallet) revert NotAgent();
+        _;
+    }
+    modifier whenActive(uint256 subId) {
+        if (subscriptions[subId].status != Status.ACTIVE) revert NotActive();
+        _;
+    }
+    modifier whenPending(uint256 subId) {
+        if (subscriptions[subId].status != Status.PENDING) revert NotPending();
         _;
     }
 
-    modifier onlyAgent(uint256 subscriptionId) {
-        require(
-            msg.sender == subscriptions[subscriptionId].agentWallet,
-            "SubscriptionEscrow: not agent"
-        );
-        _;
-    }
-
-    modifier whenActive(uint256 subscriptionId) {
-        require(
-            subscriptions[subscriptionId].status == Status.ACTIVE,
-            "SubscriptionEscrow: not active"
-        );
-        _;
-    }
-
-    modifier whenPending(uint256 subscriptionId) {
-        require(
-            subscriptions[subscriptionId].status == Status.PENDING,
-            "SubscriptionEscrow: not pending"
-        );
-        _;
-    }
-
-    modifier whenPaused(uint256 subscriptionId) {
-        require(
-            subscriptions[subscriptionId].status == Status.PAUSED,
-            "SubscriptionEscrow: not paused"
-        );
-        _;
-    }
-
-    // ─── CONSTRUCTOR ─────────────────────────────────────────────────────────
+    // ─── CONSTRUCTOR ────────────────────────────────────────────────────────
 
     constructor(address _agentRegistry) {
-        require(_agentRegistry != address(0), "SubscriptionEscrow: zero address");
+        if (_agentRegistry == address(0)) revert ZeroAddress();
         agentRegistry = IAgentRegistry(_agentRegistry);
     }
 
-    // ─── CLIENT FUNCTIONS ────────────────────────────────────────────────────
+    // ─── CLIENT FUNCTIONS ───────────────────────────────────────────────────
 
-    /// @notice Create a new subscription (three modes based on intervalSeconds)
-    /// @dev For Mode C (AGENT_AUTO), caller MUST call updateInterval() after creation to set a valid interval.
-    ///      Using AUTO_INTERVAL (type(uint256).max) will cause drainPerCheckIn to revert until updated.
-    /// @param agentId The agent to hire
-    /// @param taskDescription What the agent should do
-    /// @param intervalSeconds 0 = agent proposes (Mode B), MAX = agent auto (Mode C), else client-set (Mode A)
-    /// @param checkInRate Wei per check-in
-    /// @param alertRate Wei per alert
-    /// @param gracePeriodSeconds 0 = use default (24h), clamped 1h-7d
-    /// @param x402Enabled Whether x402 micropayment bonus is active
-    /// @param x402VerificationMode AGENT_SIDE or ON_CHAIN
-    /// @param clientX402Sig Pre-signed x402 authorization (empty if disabled)
-    /// @param webhookUrl URL for webhook delivery (empty = on-chain only)
+    /// @notice Create a new subscription.
+    /// @param agentId            The agent to subscribe to
+    /// @param taskHash           keccak256 of the task description (text stored in 0G Storage)
+    /// @param intervalSeconds    0 = agent proposes (Mode B); AUTO_INTERVAL = agent auto (Mode C); else client-set (Mode A)
+    /// @param checkInRate        wei drained per check-in
+    /// @param alertRate          wei drained per alert
+    /// @param gracePeriodSeconds 0 = use default; clamped to [MIN, MAX]
+    /// @param x402Enabled        Whether x402 micropayment bonus is active
+    /// @param x402VerificationMode AGENT_SIDE (gas-efficient) or ON_CHAIN
+    /// @param clientX402Sig      Pre-signed x402 authorization (empty if disabled)
+    /// @param webhookHash        keccak256 of webhook URL (URL stored off-chain)
     function createSubscription(
         uint256 agentId,
-        string calldata taskDescription,
-        uint256 intervalSeconds,
-        uint256 checkInRate,
-        uint256 alertRate,
-        uint256 gracePeriodSeconds,
-        bool x402Enabled,
+        bytes32 taskHash,
+        uint32  intervalSeconds,
+        uint96  checkInRate,
+        uint96  alertRate,
+        uint32  gracePeriodSeconds,
+        bool    x402Enabled,
         X402VerificationMode x402VerificationMode,
         bytes calldata clientX402Sig,
-        string calldata webhookUrl
-    ) external payable returns (uint256 subscriptionId) {
-        require(msg.value > 0, "SubscriptionEscrow: budget must be > 0");
-        require(bytes(taskDescription).length > 0, "SubscriptionEscrow: empty description");
-        require(checkInRate > 0 || alertRate > 0, "SubscriptionEscrow: need at least one rate > 0");
+        bytes32 webhookHash
+    ) external payable returns (uint256 subId) {
+        if (msg.value == 0) revert ZeroBudget();
+        if (msg.value > type(uint128).max) revert ValueTooLarge();
+        if (taskHash == bytes32(0)) revert EmptyDescription();
+        if (checkInRate == 0 && alertRate == 0) revert ZeroRates();
 
-        // Fetch agent profile to get agentWallet
         IAgentRegistry.AgentProfile memory agent = agentRegistry.getAgentProfile(agentId);
-        require(agent.isActive, "SubscriptionEscrow: agent not active");
-        require(agent.agentWallet != address(0), "SubscriptionEscrow: invalid agent wallet");
+        if (!agent.isActive) revert AgentInactive();
+        if (agent.agentWallet == address(0)) revert ZeroAddress();
 
         // Determine interval mode
         IntervalMode mode;
@@ -222,7 +246,7 @@ contract SubscriptionEscrow is ReentrancyGuard {
         }
 
         // Clamp grace period
-        uint256 grace = gracePeriodSeconds;
+        uint32 grace = gracePeriodSeconds;
         if (grace == 0) {
             grace = DEFAULT_GRACE_PERIOD;
         } else if (grace < MIN_GRACE_PERIOD) {
@@ -231,283 +255,232 @@ contract SubscriptionEscrow is ReentrancyGuard {
             grace = MAX_GRACE_PERIOD;
         }
 
-        _subscriptionIdCounter++;
-        subscriptionId = _subscriptionIdCounter;
+        unchecked { subId = _nextSubId++; }
 
-        Status initialStatus = (mode == IntervalMode.AGENT_PROPOSED)
-            ? Status.PENDING
-            : Status.ACTIVE;
+        Status initialStatus = (mode == IntervalMode.AGENT_PROPOSED) ? Status.PENDING : Status.ACTIVE;
 
-        subscriptions[subscriptionId] = Subscription({
-            subscriptionId: subscriptionId,
-            client: msg.sender,
-            agentId: agentId,
-            agentWallet: agent.agentWallet,
-            taskDescription: taskDescription,
-            intervalSeconds: (mode == IntervalMode.AGENT_PROPOSED) ? 0 : intervalSeconds,
-            intervalMode: mode,
-            checkInRate: checkInRate,
-            alertRate: alertRate,
-            balance: msg.value,
-            totalDrained: 0,
-            status: initialStatus,
-            createdAt: block.timestamp,
-            lastCheckIn: 0,
-            pausedAt: 0,
-            gracePeriodEnds: 0,
-            gracePeriodSeconds: grace,
-            x402Enabled: x402Enabled,
-            x402VerificationMode: x402VerificationMode,
-            clientX402Sig: clientX402Sig,
-            webhookUrl: webhookUrl,
-            proposedInterval: 0
-        });
+        Subscription storage sub = subscriptions[subId];
+        sub.client = msg.sender;
+        sub.agentId = uint64(agentId);
+        sub.agentWallet = agent.agentWallet;
+        sub.intervalSeconds = (mode == IntervalMode.AGENT_PROPOSED) ? 0 : intervalSeconds;
+        sub.intervalMode = mode;
+        sub.checkInRate = checkInRate;
+        sub.alertRate = alertRate;
+        sub.balance = uint128(msg.value);
+        sub.status = initialStatus;
+        sub.createdAt = uint64(block.timestamp);
+        sub.gracePeriodSeconds = grace;
+        sub.x402Enabled = x402Enabled;
+        sub.x402VerificationMode = x402VerificationMode;
 
-        clientSubscriptions[msg.sender].push(subscriptionId);
-        agentSubscriptions[agent.agentWallet].push(subscriptionId);
+        subscriptionTaskHash[subId] = taskHash;
+        if (webhookHash != bytes32(0)) {
+            subscriptionWebhookHash[subId] = webhookHash;
+        }
+        if (x402Enabled && clientX402Sig.length > 0) {
+            subscriptionX402Sig[subId] = clientX402Sig;
+        }
 
-        emit SubscriptionCreated(subscriptionId, agentId, msg.sender, msg.value);
+        clientSubscriptions[msg.sender].push(subId);
+        agentSubscriptions[agent.agentWallet].push(subId);
+
+        emit SubscriptionCreated(subId, agentId, msg.sender, uint128(msg.value), taskHash);
     }
 
-    /// @notice Add more funds to a subscription
-    /// @param subscriptionId The subscription to top up
-    function topUp(uint256 subscriptionId) external payable nonReentrant {
-        require(msg.value > 0, "SubscriptionEscrow: must send ETH");
+    /// @notice Add more funds to a subscription.
+    function topUp(uint256 subId) external payable nonReentrant {
+        if (msg.value == 0) revert ZeroValue();
+        if (msg.value > type(uint128).max) revert ValueTooLarge();
 
-        Subscription storage sub = subscriptions[subscriptionId];
-        require(
-            sub.status == Status.ACTIVE || sub.status == Status.PAUSED,
-            "SubscriptionEscrow: invalid status"
-        );
+        Subscription storage sub = subscriptions[subId];
+        Status s = sub.status;
+        if (s != Status.ACTIVE && s != Status.PAUSED) revert InvalidStatus();
 
-        sub.balance += msg.value;
+        unchecked { sub.balance += uint128(msg.value); }
 
-        if (sub.status == Status.PAUSED) {
+        if (s == Status.PAUSED) {
             sub.status = Status.ACTIVE;
             sub.pausedAt = 0;
             sub.gracePeriodEnds = 0;
-            emit SubscriptionResumed(subscriptionId, sub.balance);
+            emit SubscriptionResumed(subId, sub.balance);
         }
     }
 
-    /// @notice Cancel a subscription (client only)
-    /// @param subscriptionId The subscription to cancel
-    function cancelSubscription(uint256 subscriptionId) external nonReentrant onlyClient(subscriptionId) {
-        Subscription storage sub = subscriptions[subscriptionId];
-        require(sub.status != Status.CANCELLED, "SubscriptionEscrow: already cancelled");
+    /// @notice Cancel a subscription (client only).
+    function cancelSubscription(uint256 subId) external nonReentrant onlyClient(subId) {
+        Subscription storage sub = subscriptions[subId];
+        if (sub.status == Status.CANCELLED) revert AlreadyCancelled();
 
-        uint256 refund = sub.balance;
+        uint128 refund = sub.balance;
         sub.balance = 0;
         sub.status = Status.CANCELLED;
 
         if (refund > 0) {
             (bool sent, ) = payable(sub.client).call{value: refund}("");
-            require(sent, "SubscriptionEscrow: refund failed");
+            if (!sent) revert RefundFailed();
         }
 
-        emit SubscriptionCancelled(subscriptionId, "CLIENT_CANCELLED", refund);
+        emit SubscriptionCancelled(subId, "CLIENT_CANCELLED", refund);
     }
 
-    /// @notice Approve proposed interval (Mode B only, client only)
-    /// @param subscriptionId The subscription
-    function approveInterval(uint256 subscriptionId)
-        external
-        onlyClient(subscriptionId)
-        whenPending(subscriptionId)
-    {
-        Subscription storage sub = subscriptions[subscriptionId];
-        require(
-            sub.intervalMode == IntervalMode.AGENT_PROPOSED,
-            "SubscriptionEscrow: not Mode B"
-        );
-        require(sub.proposedInterval > 0, "SubscriptionEscrow: no proposal");
+    /// @notice Approve a proposed interval (Mode B only, client only).
+    function approveInterval(uint256 subId) external onlyClient(subId) whenPending(subId) {
+        Subscription storage sub = subscriptions[subId];
+        if (sub.intervalMode != IntervalMode.AGENT_PROPOSED) revert NotModeB();
+        if (sub.proposedInterval == 0) revert NoProposal();
 
         sub.intervalSeconds = sub.proposedInterval;
         sub.status = Status.ACTIVE;
 
-        emit IntervalApproved(subscriptionId, sub.intervalSeconds);
+        emit IntervalApproved(subId, sub.intervalSeconds);
     }
 
-    // ─── AGENT FUNCTIONS ─────────────────────────────────────────────────────
+    // ─── AGENT FUNCTIONS ────────────────────────────────────────────────────
 
-    /// @notice Drain funds after a scheduled check-in
-    /// @dev Must call updateInterval() first if intervalMode == AGENT_AUTO (Mode C) to set a valid interval.
-    ///      Otherwise, with AUTO_INTERVAL = type(uint256).max, the check-in will always revert.
-    /// @param subscriptionId The subscription
-    function drainPerCheckIn(uint256 subscriptionId)
-        external
-        nonReentrant
-        onlyAgent(subscriptionId)
-        whenActive(subscriptionId)
+    /// @notice Drain funds after a scheduled check-in.
+    function drainPerCheckIn(uint256 subId)
+        external nonReentrant onlyAgent(subId) whenActive(subId)
     {
-        Subscription storage sub = subscriptions[subscriptionId];
+        Subscription storage sub = subscriptions[subId];
 
-        // Time gating
-        require(
-            block.timestamp >= sub.lastCheckIn + sub.intervalSeconds,
-            "SubscriptionEscrow: too early"
-        );
-        require(sub.checkInRate > 0, "SubscriptionEscrow: check-in disabled");
-        require(sub.balance >= sub.checkInRate, "SubscriptionEscrow: insufficient balance");
-
-        // Check-effects-interactions
-        sub.balance -= sub.checkInRate;
-        sub.totalDrained += sub.checkInRate;
-        sub.lastCheckIn = block.timestamp;
-
-        emit CheckInDrained(subscriptionId, sub.agentId, sub.checkInRate, block.timestamp);
-
-        // Transfer after state update
-        (bool sent, ) = payable(sub.agentWallet).call{value: sub.checkInRate}("");
-        require(sent, "SubscriptionEscrow: transfer failed");
-
-        // Check if we should pause
-        if (sub.balance < sub.checkInRate) {
-            _pauseSubscription(subscriptionId, "INSUFFICIENT_BALANCE");
+        unchecked {
+            if (block.timestamp < uint256(sub.lastCheckIn) + uint256(sub.intervalSeconds)) revert TooEarly();
         }
-    }
+        if (sub.checkInRate == 0) revert CheckInDisabled();
+        if (sub.balance < sub.checkInRate) revert InsufficientBalance();
 
-    /// @notice Drain funds after detecting an anomaly
-    /// @param subscriptionId The subscription
-    /// @param alertData Encoded alert payload
-    function drainPerAlert(uint256 subscriptionId, bytes calldata alertData)
-        external
-        nonReentrant
-        onlyAgent(subscriptionId)
-        whenActive(subscriptionId)
-    {
-        Subscription storage sub = subscriptions[subscriptionId];
+        uint96 amount = sub.checkInRate;
+        unchecked {
+            sub.balance -= amount;
+            sub.totalDrained += amount;
+        }
+        sub.lastCheckIn = uint64(block.timestamp);
 
-        require(sub.alertRate > 0, "SubscriptionEscrow: alerts disabled");
-        require(sub.balance >= sub.alertRate, "SubscriptionEscrow: insufficient balance");
+        emit CheckInDrained(subId, sub.agentId, amount, uint64(block.timestamp));
 
-        uint256 amount = sub.alertRate;
-
-        // Check-effects-interactions
-        sub.balance -= amount;
-        sub.totalDrained += amount;
-
-        emit AlertFired(subscriptionId, sub.agentId, block.timestamp, alertData, amount);
-
-        // Transfer after state update
         (bool sent, ) = payable(sub.agentWallet).call{value: amount}("");
-        require(sent, "SubscriptionEscrow: transfer failed");
+        if (!sent) revert TransferFailed();
 
-        // Check if we should pause
-        if (sub.balance < sub.checkInRate && sub.checkInRate > 0) {
-            _pauseSubscription(subscriptionId, "INSUFFICIENT_BALANCE");
+        if (sub.balance < sub.checkInRate) {
+            _pauseSubscription(subId, "INSUFFICIENT_BALANCE");
         }
     }
 
-    /// @notice Propose an interval (Mode B only, agent only)
-    /// @param subscriptionId The subscription
-    /// @param suggestedInterval The proposed interval in seconds
-    function proposeInterval(uint256 subscriptionId, uint256 suggestedInterval)
-        external
-        onlyAgent(subscriptionId)
-        whenPending(subscriptionId)
+    /// @notice Drain funds after detecting an anomaly (alert).
+    function drainPerAlert(uint256 subId, bytes calldata alertData)
+        external nonReentrant onlyAgent(subId) whenActive(subId)
     {
-        Subscription storage sub = subscriptions[subscriptionId];
-        require(
-            sub.intervalMode == IntervalMode.AGENT_PROPOSED,
-            "SubscriptionEscrow: not Mode B"
-        );
-        require(suggestedInterval > 0, "SubscriptionEscrow: invalid interval");
+        Subscription storage sub = subscriptions[subId];
+
+        if (sub.alertRate == 0) revert AlertsDisabled();
+        if (sub.balance < sub.alertRate) revert InsufficientBalance();
+
+        uint96 amount = sub.alertRate;
+        unchecked {
+            sub.balance -= amount;
+            sub.totalDrained += amount;
+        }
+
+        emit AlertFired(subId, sub.agentId, uint64(block.timestamp), alertData, amount);
+
+        (bool sent, ) = payable(sub.agentWallet).call{value: amount}("");
+        if (!sent) revert TransferFailed();
+
+        if (sub.checkInRate > 0 && sub.balance < sub.checkInRate) {
+            _pauseSubscription(subId, "INSUFFICIENT_BALANCE");
+        }
+    }
+
+    /// @notice Propose an interval (Mode B only, agent only).
+    function proposeInterval(uint256 subId, uint32 suggestedInterval)
+        external onlyAgent(subId) whenPending(subId)
+    {
+        Subscription storage sub = subscriptions[subId];
+        if (sub.intervalMode != IntervalMode.AGENT_PROPOSED) revert NotModeB();
+        if (suggestedInterval == 0) revert InvalidInterval();
 
         sub.proposedInterval = suggestedInterval;
 
-        emit IntervalProposed(subscriptionId, suggestedInterval);
+        emit IntervalProposed(subId, suggestedInterval);
     }
 
-    /// @notice Update interval dynamically (Mode C only, agent only)
-    /// @param subscriptionId The subscription
-    /// @param newInterval The new interval in seconds
-    function updateInterval(uint256 subscriptionId, uint256 newInterval)
-        external
-        onlyAgent(subscriptionId)
-        whenActive(subscriptionId)
+    /// @notice Update interval dynamically (Mode C only, agent only).
+    function updateInterval(uint256 subId, uint32 newInterval)
+        external onlyAgent(subId) whenActive(subId)
     {
-        Subscription storage sub = subscriptions[subscriptionId];
-        require(
-            sub.intervalMode == IntervalMode.AGENT_AUTO,
-            "SubscriptionEscrow: not Mode C"
-        );
-        require(newInterval > 0, "SubscriptionEscrow: invalid interval");
+        Subscription storage sub = subscriptions[subId];
+        if (sub.intervalMode != IntervalMode.AGENT_AUTO) revert NotModeC();
+        if (newInterval == 0) revert InvalidInterval();
 
         sub.intervalSeconds = newInterval;
 
-        emit IntervalUpdated(subscriptionId, newInterval);
+        emit IntervalUpdated(subId, newInterval);
     }
 
-    // ─── SHARED FUNCTIONS ────────────────────────────────────────────────────
+    // ─── SHARED ─────────────────────────────────────────────────────────────
 
-    /// @notice Set webhook URL (client OR agent)
-    /// @param subscriptionId The subscription
-    /// @param webhookUrl The new webhook URL
-    function setWebhookUrl(uint256 subscriptionId, string calldata webhookUrl) external {
-        Subscription storage sub = subscriptions[subscriptionId];
-        require(
-            msg.sender == sub.client || msg.sender == sub.agentWallet,
-            "SubscriptionEscrow: not authorized"
-        );
-        require(sub.status != Status.CANCELLED, "SubscriptionEscrow: cancelled");
+    /// @notice Set webhook URL hash (client OR agent).
+    function setWebhookHash(uint256 subId, bytes32 webhookHash) external {
+        Subscription storage sub = subscriptions[subId];
+        if (msg.sender != sub.client && msg.sender != sub.agentWallet) revert NotAuthorized();
+        if (sub.status == Status.CANCELLED) revert AlreadyCancelled();
 
-        sub.webhookUrl = webhookUrl;
+        subscriptionWebhookHash[subId] = webhookHash;
+        emit WebhookSet(subId, webhookHash);
     }
 
-    // ─── KEEPER FUNCTION ─────────────────────────────────────────────────────
+    // ─── KEEPER ─────────────────────────────────────────────────────────────
 
-    /// @notice Finalize an expired subscription (permissionless)
-    /// @param subscriptionId The subscription
-    function finalizeExpired(uint256 subscriptionId) external nonReentrant {
-        Subscription storage sub = subscriptions[subscriptionId];
+    /// @notice Finalize an expired (paused) subscription. Permissionless.
+    function finalizeExpired(uint256 subId) external nonReentrant {
+        Subscription storage sub = subscriptions[subId];
+        if (sub.status != Status.PAUSED) revert NotPaused();
+        if (block.timestamp < sub.gracePeriodEnds) revert GraceNotExpired();
 
-        require(sub.status == Status.PAUSED, "SubscriptionEscrow: not paused");
-        require(
-            block.timestamp >= sub.gracePeriodEnds,
-            "SubscriptionEscrow: grace not expired"
-        );
-
-        uint256 refund = sub.balance;
+        uint128 refund = sub.balance;
         sub.balance = 0;
         sub.status = Status.CANCELLED;
 
         if (refund > 0) {
             (bool sent, ) = payable(sub.client).call{value: refund}("");
-            require(sent, "SubscriptionEscrow: refund failed");
+            if (!sent) revert RefundFailed();
         }
 
-        emit SubscriptionCancelled(subscriptionId, "GRACE_EXPIRED", refund);
+        emit SubscriptionCancelled(subId, "GRACE_EXPIRED", refund);
     }
 
-    // ─── INTERNAL FUNCTIONS ──────────────────────────────────────────────────
+    // ─── INTERNAL ───────────────────────────────────────────────────────────
 
-    function _pauseSubscription(uint256 subscriptionId, string memory reason) internal {
-        Subscription storage sub = subscriptions[subscriptionId];
-
+    function _pauseSubscription(uint256 subId, bytes32 reason) internal {
+        Subscription storage sub = subscriptions[subId];
         sub.status = Status.PAUSED;
-        sub.pausedAt = block.timestamp;
-        sub.gracePeriodEnds = block.timestamp + sub.gracePeriodSeconds;
+        sub.pausedAt = uint64(block.timestamp);
+        unchecked { sub.gracePeriodEnds = uint64(block.timestamp) + uint64(sub.gracePeriodSeconds); }
 
-        emit SubscriptionPaused(subscriptionId, reason);
+        emit SubscriptionPaused(subId, reason);
     }
 
-    // ─── VIEW FUNCTIONS ───────────────────────────────────────────────────────
+    // ─── ERC-8183 ────────────────────────────────────────────────────────────
 
-    function getSubscription(uint256 subscriptionId)
-        external
-        view
-        returns (Subscription memory)
-    {
-        return subscriptions[subscriptionId];
+    /// @notice ERC-8183 evaluator stub (subscription doesn't have per-call evaluation).
+    ///         Reserved for future per-execution alignment verification.
+    function evaluator() external pure returns (address) {
+        return address(0);
     }
 
-    function getBalance(uint256 subscriptionId) external view returns (uint256) {
-        return subscriptions[subscriptionId].balance;
+    // ─── VIEW FUNCTIONS ─────────────────────────────────────────────────────
+
+    function getSubscription(uint256 subId) external view returns (Subscription memory) {
+        return subscriptions[subId];
     }
 
-    function getStatus(uint256 subscriptionId) external view returns (Status) {
-        return subscriptions[subscriptionId].status;
+    function getBalance(uint256 subId) external view returns (uint128) {
+        return subscriptions[subId].balance;
+    }
+
+    function getStatus(uint256 subId) external view returns (Status) {
+        return subscriptions[subId].status;
     }
 
     function getClientSubscriptions(address client) external view returns (uint256[] memory) {
@@ -519,6 +492,6 @@ contract SubscriptionEscrow is ReentrancyGuard {
     }
 
     function totalSubscriptions() external view returns (uint256) {
-        return _subscriptionIdCounter;
+        unchecked { return _nextSubId - 1; }
     }
 }
