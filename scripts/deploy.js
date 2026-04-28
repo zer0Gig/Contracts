@@ -39,15 +39,7 @@ async function main() {
   await linkTx.wait();
   console.log("AgentRegistry authorized escrow:", escrowAddress);
 
-  // --- 4. Register platform wallet as authorized releaser ---
-  const platformWallet = process.env.PLATFORM_WALLET || deployer.address;
-  console.log("\n--- Registering platform wallet as authorized releaser ---");
-  console.log("Platform wallet:", platformWallet);
-  const releaserTx = await escrow.addAuthorizedReleaser(platformWallet);
-  await releaserTx.wait();
-  console.log("Platform wallet authorized as releaser:", platformWallet);
-
-  // --- 5. Deploy SubscriptionEscrow (TIER 3) ---
+  // --- 4. Deploy SubscriptionEscrow (TIER 3) ---
   console.log("\n--- Deploying SubscriptionEscrow ---");
   const SubscriptionEscrow = await hre.ethers.getContractFactory("SubscriptionEscrow");
   const subscriptionEscrow = await SubscriptionEscrow.deploy(registryAddress);
@@ -55,7 +47,12 @@ async function main() {
   const subscriptionEscrowAddress = await subscriptionEscrow.getAddress();
   console.log("SubscriptionEscrow deployed to:", subscriptionEscrowAddress);
 
-  // --- 5. Deploy UserRegistry ---
+  // --- 5. Link SubscriptionEscrow to AgentRegistry ---
+  const subLinkTx = await agentRegistry.addEscrowContract(subscriptionEscrowAddress);
+  await subLinkTx.wait();
+  console.log("AgentRegistry authorized escrow:", subscriptionEscrowAddress);
+
+  // --- 6. Deploy UserRegistry ---
   console.log("\n--- Deploying UserRegistry ---");
   const UserRegistry = await hre.ethers.getContractFactory("UserRegistry");
   const userRegistry = await UserRegistry.deploy();
@@ -63,7 +60,7 @@ async function main() {
   const userRegistryAddress = await userRegistry.getAddress();
   console.log("UserRegistry deployed to:", userRegistryAddress);
 
-  // --- 6. Save deployment info ---
+  // --- 7. Save deployment info ---
   const deployment = {
     AgentRegistry: registryAddress,
     ProgressiveEscrow: escrowAddress,
