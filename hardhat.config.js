@@ -9,7 +9,7 @@ module.exports = {
     settings: {
       optimizer: {
         enabled: true,
-        runs: 200,
+        runs: 800,           // Optimize for frequent calls (txn cost) over deploy size
       },
       viaIR: true,
     },
