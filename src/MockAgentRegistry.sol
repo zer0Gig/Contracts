@@ -1,22 +1,28 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @notice Mock AgentRegistry for testing SubscriptionEscrow
+/// @notice Mock AgentRegistry for testing escrow contracts.
+///         Mirrors the packed AgentProfile struct of the real ERC-7857 AgentRegistry.
 contract MockAgentRegistry {
     struct AgentProfile {
+        // Slot 0
         address owner;
-        address agentWallet;
-        bytes eciesPublicKey;
+        uint48  createdAt;
+        uint16  winRate;
+        uint16  version;
+        bool    isActive;
+        // Slot 1
         bytes32 capabilityHash;
-        string capabilityCID;
-        string profileCID;
-        uint256 overallScore;
-        uint256 totalJobsCompleted;
-        uint256 totalJobsAttempted;
-        uint256 totalEarningsWei;
-        uint256 defaultRate;
-        uint256 createdAt;
-        bool isActive;
+        // Slot 2
+        bytes32 profileHash;
+        // Slot 3
+        address agentWallet;
+        uint64  totalJobsCompleted;
+        uint32  defaultRate;
+        // Slot 4
+        uint64  totalJobsAttempted;
+        uint128 totalEarningsWei;
+        uint48  updatedAt;
     }
 
     mapping(uint256 => AgentProfile) public agents;
@@ -24,26 +30,20 @@ contract MockAgentRegistry {
 
     function mintAgent(
         address agentWallet,
-        string calldata profileCID,
-        string calldata capabilityCID
-    ) external returns (uint256) {
-        _counter++;
-        agents[_counter] = AgentProfile({
-            owner: msg.sender,
-            agentWallet: agentWallet,
-            eciesPublicKey: "",
-            capabilityHash: keccak256(bytes(capabilityCID)),
-            capabilityCID: capabilityCID,
-            profileCID: profileCID,
-            overallScore: 8000,
-            totalJobsCompleted: 0,
-            totalJobsAttempted: 0,
-            totalEarningsWei: 0,
-            defaultRate: 0,
-            createdAt: block.timestamp,
-            isActive: true
-        });
-        return _counter;
+        bytes32 profileHash,
+        bytes32 capabilityHash
+    ) external returns (uint256 agentId) {
+        unchecked { agentId = ++_counter; }
+        AgentProfile storage a = agents[agentId];
+        a.owner = msg.sender;
+        a.createdAt = uint48(block.timestamp);
+        a.updatedAt = uint48(block.timestamp);
+        a.winRate = 8000;
+        a.version = 1;
+        a.isActive = true;
+        a.capabilityHash = capabilityHash;
+        a.profileHash = profileHash;
+        a.agentWallet = agentWallet;
     }
 
     function getAgentProfile(uint256 agentId) external view returns (AgentProfile memory) {
@@ -52,5 +52,13 @@ contract MockAgentRegistry {
 
     function toggleActive(uint256 agentId, bool active) external {
         agents[agentId].isActive = active;
+    }
+
+    function recordJobResult(uint256, uint128, bool, bytes32) external {
+        // No-op for mock
+    }
+
+    function hasSkill(uint256, bytes32) external pure returns (bool) {
+        return true;
     }
 }
