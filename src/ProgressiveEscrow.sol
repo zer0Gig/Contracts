@@ -72,6 +72,8 @@ contract ProgressiveEscrow is ReentrancyGuard {
     error InvalidScore();
     error InvalidSignature();
     error TransferFailed();
+    error NotStale();
+    error JobNotInProgressForCancel();
     error RefundFailed();
     error ZeroRate();
     error MilestonesAlreadyDefined();
@@ -180,6 +182,14 @@ contract ProgressiveEscrow is ReentrancyGuard {
     uint256 public constant APPROVAL_THRESHOLD = 8000; // 80%
     uint256 public constant MAX_RETRIES = 5;
     uint8   public constant MAX_MILESTONES = 10;
+
+    /// @notice After this many seconds of no milestone submission, the client may
+    /// reclaim the unreleased budget via `cancelStaleJob`. 7 days by default.
+    uint64  public constant STALE_JOB_TIMEOUT = 7 days;
+
+    /// @notice Last on-chain activity (proposal accepted, milestone submitted/approved/rejected)
+    /// for an IN_PROGRESS job. Used by `cancelStaleJob` to enforce the timeout.
+    mapping(uint256 => uint64) public jobLastActivityAt;
 
     // ─── EVENTS ─────────────────────────────────────────────────────────────
 
@@ -343,6 +353,7 @@ contract ProgressiveEscrow is ReentrancyGuard {
 
         job.milestoneCount = uint8(len);
         job.status = JobStatus.IN_PROGRESS;
+        jobLastActivityAt[jobId] = uint64(block.timestamp);
 
         emit MilestoneDefined(jobId, uint8(len));
     }
@@ -378,6 +389,7 @@ contract ProgressiveEscrow is ReentrancyGuard {
         milestone.alignmentScore = alignmentScore;
         milestone.submittedAt = uint48(block.timestamp);
         unchecked { milestone.retryCount += 1; }
+        jobLastActivityAt[jobId] = uint64(block.timestamp);
 
         emit MilestoneSubmitted(jobId, milestoneIndex, outputHash, milestone.retryCount);
         // ERC-8183
@@ -433,6 +445,36 @@ contract ProgressiveEscrow is ReentrancyGuard {
 
         emit JobCancelled(jobId, refund);
         // ERC-8183
+        emit JobTerminal(jobId, false, abi.encode(refund));
+    }
+
+    /// @notice Reclaim funds from a stalled IN_PROGRESS job. The client may call
+    /// this after STALE_JOB_TIMEOUT seconds have elapsed since the agent's last
+    /// on-chain activity (acceptProposal, milestone submit/approve/reject).
+    /// Refunds the unreleased portion only — already-released milestones stay
+    /// with the agent. The agent's reputation is decremented (failed job).
+    function cancelStaleJob(uint256 jobId) external nonReentrant {
+        Job storage job = jobs[jobId];
+        if (msg.sender != job.client) revert NotClient();
+        if (job.status != JobStatus.IN_PROGRESS) revert JobNotInProgressForCancel();
+
+        uint64 lastActivity = jobLastActivityAt[jobId];
+        if (lastActivity == 0) lastActivity = job.createdAt;
+        if (block.timestamp < uint256(lastActivity) + STALE_JOB_TIMEOUT) revert NotStale();
+
+        uint96 refund;
+        unchecked { refund = job.totalBudgetWei - job.releasedWei; }
+        job.status = JobStatus.CANCELLED;
+
+        // Reputation hit on the agent (treated as a failed job, no payout for this slice)
+        agentRegistry.recordJobResult(uint256(job.agentId), 0, false, job.skillId);
+
+        if (refund > 0) {
+            (bool sent, ) = payable(job.client).call{value: refund}("");
+            if (!sent) revert RefundFailed();
+        }
+
+        emit JobCancelled(jobId, refund);
         emit JobTerminal(jobId, false, abi.encode(refund));
     }
 

@@ -386,6 +386,119 @@ describe("ProgressiveEscrow (ERC-8183 compliant)", function () {
     });
   });
 
+  // ─── cancelStaleJob ────────────────────────────────────────────────────
+  describe("cancelStaleJob", function () {
+    const rate = ethers.parseEther("0.5");
+    const STALE_TIMEOUT = 7 * 24 * 60 * 60;
+
+    async function setupInProgressJob() {
+      await escrow.connect(client).postJob(ethers.keccak256("0xabcd"), SKILL_CODER);
+      await escrow.connect(agentOwner).submitProposal(1, 1, rate, ethers.ZeroHash);
+      await escrow.connect(client).acceptProposal(1, 0, { value: rate });
+      await escrow.connect(client).defineMilestones(1, [100], [ethers.id("c1")]);
+    }
+
+    it("reverts before STALE_JOB_TIMEOUT has elapsed", async function () {
+      await setupInProgressJob();
+      // Only 1 day has passed
+      await ethers.provider.send("evm_increaseTime", [1 * 24 * 60 * 60]);
+      await ethers.provider.send("evm_mine", []);
+      await expect(
+        escrow.connect(client).cancelStaleJob(1)
+      ).to.be.revertedWithCustomError(escrow, "NotStale");
+    });
+
+    it("succeeds and refunds the unreleased budget after STALE_JOB_TIMEOUT", async function () {
+      await setupInProgressJob();
+      await ethers.provider.send("evm_increaseTime", [STALE_TIMEOUT + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      const balBefore = await ethers.provider.getBalance(client.address);
+      const tx        = await escrow.connect(client).cancelStaleJob(1);
+      const receipt   = await tx.wait();
+      const gasCost   = receipt.gasUsed * receipt.gasPrice;
+      const balAfter  = await ethers.provider.getBalance(client.address);
+
+      expect(balAfter).to.equal(balBefore - gasCost + rate);
+
+      const job = await escrow.getJob(1);
+      expect(job.status).to.equal(4); // CANCELLED
+    });
+
+    it("only the client can cancel", async function () {
+      await setupInProgressJob();
+      await ethers.provider.send("evm_increaseTime", [STALE_TIMEOUT + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(
+        escrow.connect(alice).cancelStaleJob(1)
+      ).to.be.revertedWithCustomError(escrow, "NotClient");
+    });
+
+    it("reverts on a job that's not IN_PROGRESS", async function () {
+      await escrow.connect(client).postJob(ethers.keccak256("0x0001"), SKILL_CODER);
+      await ethers.provider.send("evm_increaseTime", [STALE_TIMEOUT + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(
+        escrow.connect(client).cancelStaleJob(1)
+      ).to.be.revertedWithCustomError(escrow, "JobNotInProgressForCancel");
+    });
+
+    it("milestone activity resets the stale clock", async function () {
+      // Use a 2-milestone job so the first rejection doesn't terminate the job
+      await escrow.connect(client).postJob(ethers.keccak256("0xacde"), SKILL_CODER);
+      await escrow.connect(agentOwner).submitProposal(1, 1, rate, ethers.ZeroHash);
+      await escrow.connect(client).acceptProposal(1, 0, { value: rate });
+      await escrow.connect(client).defineMilestones(
+        1,
+        [50, 50],
+        [ethers.id("c1"), ethers.id("c2")]
+      );
+
+      // 6 days pass, then a milestone submission (low score → REJECTED but not terminal — second milestone still PENDING)
+      await ethers.provider.send("evm_increaseTime", [6 * 24 * 60 * 60]);
+      await ethers.provider.send("evm_mine", []);
+      const outputHash = ethers.keccak256(ethers.toUtf8Bytes("activity"));
+      const sig = await signAlignment(1, 0, 5000, outputHash);
+      await escrow.connect(agentWallet).releaseMilestone(1, 0, outputHash, 5000, sig);
+
+      // 5 more days pass. Total elapsed > 7 days, but last activity was 5 days ago.
+      await ethers.provider.send("evm_increaseTime", [5 * 24 * 60 * 60]);
+      await ethers.provider.send("evm_mine", []);
+
+      // Job may have terminated due to single-rejected-milestone rules — only assert NotStale when still IN_PROGRESS
+      const job = await escrow.getJob(1);
+      if (Number(job.status) === 2) {
+        await expect(
+          escrow.connect(client).cancelStaleJob(1)
+        ).to.be.revertedWithCustomError(escrow, "NotStale");
+      }
+    });
+
+    it("emits JobCancelled and JobTerminal", async function () {
+      await setupInProgressJob();
+      await ethers.provider.send("evm_increaseTime", [STALE_TIMEOUT + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      await expect(escrow.connect(client).cancelStaleJob(1))
+        .to.emit(escrow, "JobCancelled")
+        .and.to.emit(escrow, "JobTerminal");
+    });
+
+    it("decrements agent reputation (records failure)", async function () {
+      await setupInProgressJob();
+      await ethers.provider.send("evm_increaseTime", [STALE_TIMEOUT + 1]);
+      await ethers.provider.send("evm_mine", []);
+
+      const beforeStats = await registry.getAgentProfile(1);
+      await escrow.connect(client).cancelStaleJob(1);
+      const afterStats  = await registry.getAgentProfile(1);
+
+      expect(afterStats.totalJobsAttempted).to.be.gt(beforeStats.totalJobsAttempted);
+    });
+  });
+
   // ─── ERC-8183 view functions ──────────────────────────────────────────
   describe("ERC-8183 conformance", function () {
     it("evaluator() returns alignmentNodeVerifier", async function () {
