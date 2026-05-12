@@ -219,7 +219,7 @@ async function main() {
   const budget = ethers.parseEther("0.5");
 
   results.contracts.SubscriptionEscrow.ops.createSubscription = await bench(
-    "createSubscription (Mode A, x402 disabled)",
+    "createSubscription (Mode A, session voucher disabled)",
     subscription.connect(client).createSubscription(
       1,                                 // agentId
       "Daily crypto price alerts",
@@ -227,9 +227,9 @@ async function main() {
       checkInRate,
       alertRate,
       0,                                 // gracePeriodSeconds (use default)
-      false,                             // x402Enabled
-      0,                                 // x402VerificationMode
-      "0x",                              // clientX402Sig
+      false,                             // sessionVoucherEnabled (OKX APP session voucher)
+      0,                                 // voucherMode (0 = Delegated, 1 = Explicit Confirm)
+      "0x",                              // clientVoucherSig (empty)
       "",                                // webhookUrl
       { value: budget }
     )

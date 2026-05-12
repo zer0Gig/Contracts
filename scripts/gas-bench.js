@@ -291,7 +291,7 @@ async function main() {
   const webhookHash = ethers.ZeroHash;
 
   results.contracts.SubscriptionEscrow.ops.createSubscription = await bench(
-    "createSubscription (Mode A, x402 disabled)",
+    "createSubscription (Mode A, session voucher disabled)",
     subscription.connect(client).createSubscription(
       1, taskHash, 86400, checkInRate, alertRate, 0,
       false, 0, "0x", webhookHash,

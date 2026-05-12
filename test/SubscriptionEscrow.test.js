@@ -1,5 +1,5 @@
 // SubscriptionEscrow tests — packed Subscription struct, 3 interval modes,
-// grace period, drain flow, x402.
+// grace period, drain flow, OKX APP session voucher stub.
 //
 // Created: 2026-04-27
 
@@ -116,14 +116,16 @@ describe("SubscriptionEscrow", function () {
       expect(await escrow.subscriptionTaskHash(1)).to.equal(taskHash);
     });
 
-    it("stores x402 sig when enabled", async function () {
-      const x402Sig = "0xabcdef0123456789";
+    it("stores OKX session voucher sig when enabled (preview slot — V1 stub, see OKX_session_voucher_design.md)", async function () {
+      // V1 storage slot is still named subscriptionX402Sig; the OKX APP session-voucher
+      // schema reuses the same byte buffer until the V2 redeploy lands post-demo.
+      const clientVoucherSig = "0xabcdef0123456789";
       await escrow.connect(client).createSubscription(
         1, taskHash, intervalSeconds, checkInRate, alertRate, 0,
-        true, 0, x402Sig, ethers.ZeroHash,
+        true, 0, clientVoucherSig, ethers.ZeroHash,
         { value: budget }
       );
-      expect(await escrow.subscriptionX402Sig(1)).to.equal(x402Sig);
+      expect(await escrow.subscriptionX402Sig(1)).to.equal(clientVoucherSig);
     });
 
     it("emits SubscriptionCreated", async function () {
