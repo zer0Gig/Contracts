@@ -13,7 +13,7 @@
 const { readFileSync, writeFileSync, existsSync, mkdirSync } = require("fs");
 const { join } = require("path");
 
-const CONTRACTS    = ["AgentRegistry", "ProgressiveEscrow", "SubscriptionEscrow", "UserRegistry"];
+const CONTRACTS    = ["AgentRegistry", "ProgressiveEscrow", "SubscriptionEscrow", "UserRegistry", "AgentMarketplace", "AgentEarningsVault"];
 const ARTIFACT_DIR = join(__dirname, "..", "artifacts", "src");
 const FRONTEND_DIR = join(__dirname, "..", "..", "frontend", "src", "lib", "abis");
 
